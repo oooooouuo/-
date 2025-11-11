@@ -1,0 +1,733 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : RosMaster X3 Motor Control System
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef enum {
+    MOTOR_RR = 0,  // 右后轮 M1
+    MOTOR_RF = 1,  // 右前轮 M2
+    MOTOR_LR = 2,  // 左后轮 M3
+    MOTOR_LF = 3,  // 左前轮 M4
+    MOTOR_ALL = 4  // 所有电机
+} MotorID;
+
+typedef enum {
+    DIR_STOP = 0,
+    DIR_FORWARD,
+    DIR_BACKWARD,
+    DIR_LEFT,
+    DIR_RIGHT,
+    DIR_SPIN_LEFT,
+    DIR_SPIN_RIGHT
+} MoveDirection;
+
+typedef struct {
+    GPIO_TypeDef* portA;
+    uint16_t pinA;
+    GPIO_TypeDef* portB;
+    uint16_t pinB;
+    const char* name;
+} MotorConfig;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+// 电机引脚配置 - 根据您的原理图调整
+#define M1_A_PORT      GPIOC
+#define M1_A_PIN       GPIO_PIN_10
+#define M1_B_PORT      GPIOC
+#define M1_B_PIN       GPIO_PIN_11
+
+#define M2_A_PORT      GPIOC
+#define M2_A_PIN       GPIO_PIN_12
+#define M2_B_PORT      GPIOD
+#define M2_B_PIN       GPIO_PIN_2
+
+#define M3_A_PORT      GPIOA
+#define M3_A_PIN       GPIO_PIN_11
+#define M3_B_PORT      GPIOA
+#define M3_B_PIN       GPIO_PIN_12
+
+#define M4_A_PORT      GPIOB
+#define M4_A_PIN       GPIO_PIN_0
+#define M4_B_PORT      GPIOB
+#define M4_B_PIN       GPIO_PIN_1
+
+// 时间参数
+#define TEST_DURATION       2000
+#define DEMO_FORWARD_TIME   2000
+#define DEMO_BACKWARD_TIME  2000
+#define DEMO_TURN_TIME      1000
+#define DEMO_SPIN_TIME      1000
+#define DEMO_STOP_TIME      500
+
+// 电机控制宏
+#define MOTOR_FORWARD(portA, pinA, portB, pinB) do { \
+    HAL_GPIO_WritePin(portA, pinA, GPIO_PIN_SET); \
+    HAL_GPIO_WritePin(portB, pinB, GPIO_PIN_RESET); \
+} while(0)
+
+#define MOTOR_BACKWARD(portA, pinA, portB, pinB) do { \
+    HAL_GPIO_WritePin(portA, pinA, GPIO_PIN_RESET); \
+    HAL_GPIO_WritePin(portB, pinB, GPIO_PIN_SET); \
+} while(0)
+
+#define MOTOR_STOP(portA, pinA, portB, pinB) do { \
+    HAL_GPIO_WritePin(portA, pinA, GPIO_PIN_RESET); \
+    HAL_GPIO_WritePin(portB, pinB, GPIO_PIN_RESET); \
+} while(0)
+
+#define UART_BUFFER_SIZE 64
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart1;
+
+/* USER CODE BEGIN PV */
+uint32_t lastToggleTime = 0;
+uint32_t lastDebugTime = 0;
+uint32_t lastInputTime = 0;
+char uartBuffer[UART_BUFFER_SIZE];
+uint8_t uartIndex = 0;
+bool motorEnabled = true;
+
+// 电机配置数组
+MotorConfig motors[4] = {
+    {M1_A_PORT, M1_A_PIN, M1_B_PORT, M1_B_PIN, "RR"},  // 右后轮
+    {M2_A_PORT, M2_A_PIN, M2_B_PORT, M2_B_PIN, "RF"},  // 右前轮
+    {M3_A_PORT, M3_A_PIN, M3_B_PORT, M3_B_PIN, "LR"},  // 左后轮
+    {M4_A_PORT, M4_A_PIN, M4_B_PORT, M4_B_PIN, "LF"}   // 左前轮
+};
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
+/* USER CODE BEGIN PFP */
+void System_SelfTest(void);
+void Stop_All_Motors(void);
+void Single_Motor_Test(MotorID motor);
+void Motor_Control(MotorID motor, MoveDirection direction);
+void Car_Move_Forward(void);
+void Car_Move_Backward(void);
+void Car_Turn_Left(void);
+void Car_Turn_Right(void);
+void Car_Spin_Left(void);
+void Car_Spin_Right(void);
+void Process_Command(char* command);
+void Handle_UART_Input(void);
+void Print_Menu(void);
+void Emergency_Stop(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+// printf重定向 - ST-Link调试输出
+int _write(int file, char *ptr, int len)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+
+// 系统自检
+void System_SelfTest(void)
+{
+    printf("\r\n=== ROSMASTER X3 SYSTEM SELF-TEST ===\r\n");
+    printf("STM32F103 + AM2861 x 4 Motor Drivers\r\n");
+
+    // 测试所有电机引脚
+    for(int i = 0; i < 4; i++) {
+        printf("Testing %s motor...", motors[i].name);
+
+        // 正向测试
+        HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_SET);
+        HAL_Delay(200);
+        HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_RESET);
+
+        // 反向测试
+        HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_SET);
+        HAL_Delay(200);
+        HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_RESET);
+
+        printf("OK\r\n");
+    }
+    printf("Self-test completed successfully!\r\n");
+}
+
+// 停止所有电机
+void Stop_All_Motors(void)
+{
+    for(int i = 0; i < 4; i++) {
+        MOTOR_STOP(motors[i].portA, motors[i].pinA, motors[i].portB, motors[i].pinB);
+    }
+    printf("All motors stopped\r\n");
+}
+
+// 紧急停止
+void Emergency_Stop(void)
+{
+    Stop_All_Motors();
+    motorEnabled = false;
+    printf("!!! EMERGENCY STOP !!!\r\n");
+    printf("Type 'enable' to re-enable motors\r\n");
+}
+
+// 单个电机测试
+void Single_Motor_Test(MotorID motor)
+{
+    if(!motorEnabled) {
+        printf("Motors disabled. Type 'enable' first.\r\n");
+        return;
+    }
+
+    if(motor >= 4) return;
+
+    printf("\r\n=== TESTING %s MOTOR ===\r\n", motors[motor].name);
+
+    // 正向测试
+    printf("%s motor FORWARD...\r\n", motors[motor].name);
+    MOTOR_FORWARD(motors[motor].portA, motors[motor].pinA, motors[motor].portB, motors[motor].pinB);
+    HAL_Delay(TEST_DURATION);
+
+    // 停止
+    printf("%s motor STOP...\r\n", motors[motor].name);
+    MOTOR_STOP(motors[motor].portA, motors[motor].pinA, motors[motor].portB, motors[motor].pinB);
+    HAL_Delay(500);
+
+    // 反向测试
+    printf("%s motor BACKWARD...\r\n", motors[motor].name);
+    MOTOR_BACKWARD(motors[motor].portA, motors[motor].pinA, motors[motor].portB, motors[motor].pinB);
+    HAL_Delay(TEST_DURATION);
+
+    // 停止
+    printf("%s motor STOP...\r\n", motors[motor].name);
+    MOTOR_STOP(motors[motor].portA, motors[motor].pinA, motors[motor].portB, motors[motor].pinB);
+
+    printf("%s motor test completed\r\n", motors[motor].name);
+}
+
+// 电机控制函数
+void Motor_Control(MotorID motor, MoveDirection direction)
+{
+    if(!motorEnabled) return;
+
+    const char* dir_names[] = {"STOP", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "SPIN_LEFT", "SPIN_RIGHT"};
+
+    if(motor == MOTOR_ALL) {
+        printf("CAR MOVEMENT: %s\r\n", dir_names[direction]);
+    }
+
+    switch(motor) {
+        case MOTOR_RR: // 右后轮
+            switch(direction) {
+                case DIR_FORWARD:
+                    MOTOR_FORWARD(motors[0].portA, motors[0].pinA, motors[0].portB, motors[0].pinB);
+                    break;
+                case DIR_BACKWARD:
+                    MOTOR_BACKWARD(motors[0].portA, motors[0].pinA, motors[0].portB, motors[0].pinB);
+                    break;
+                default:
+                    MOTOR_STOP(motors[0].portA, motors[0].pinA, motors[0].portB, motors[0].pinB);
+                    break;
+            }
+            break;
+
+        case MOTOR_RF: // 右前轮
+            switch(direction) {
+                case DIR_FORWARD:
+                    MOTOR_FORWARD(motors[1].portA, motors[1].pinA, motors[1].portB, motors[1].pinB);
+                    break;
+                case DIR_BACKWARD:
+                    MOTOR_BACKWARD(motors[1].portA, motors[1].pinA, motors[1].portB, motors[1].pinB);
+                    break;
+                default:
+                    MOTOR_STOP(motors[1].portA, motors[1].pinA, motors[1].portB, motors[1].pinB);
+                    break;
+            }
+            break;
+
+        case MOTOR_LR: // 左后轮
+            switch(direction) {
+                case DIR_FORWARD:
+                    MOTOR_FORWARD(motors[2].portA, motors[2].pinA, motors[2].portB, motors[2].pinB);
+                    break;
+                case DIR_BACKWARD:
+                    MOTOR_BACKWARD(motors[2].portA, motors[2].pinA, motors[2].portB, motors[2].pinB);
+                    break;
+                default:
+                    MOTOR_STOP(motors[2].portA, motors[2].pinA, motors[2].portB, motors[2].pinB);
+                    break;
+            }
+            break;
+
+        case MOTOR_LF: // 左前轮
+            switch(direction) {
+                case DIR_FORWARD:
+                    MOTOR_FORWARD(motors[3].portA, motors[3].pinA, motors[3].portB, motors[3].pinB);
+                    break;
+                case DIR_BACKWARD:
+                    MOTOR_BACKWARD(motors[3].portA, motors[3].pinA, motors[3].portB, motors[3].pinB);
+                    break;
+                default:
+                    MOTOR_STOP(motors[3].portA, motors[3].pinA, motors[3].portB, motors[3].pinB);
+                    break;
+            }
+            break;
+
+        case MOTOR_ALL: // 所有电机 - 整车运动
+            switch(direction) {
+                case DIR_FORWARD:
+                    Car_Move_Forward();
+                    break;
+                case DIR_BACKWARD:
+                    Car_Move_Backward();
+                    break;
+                case DIR_LEFT:
+                    Car_Turn_Left();
+                    break;
+                case DIR_RIGHT:
+                    Car_Turn_Right();
+                    break;
+                case DIR_SPIN_LEFT:
+                    Car_Spin_Left();
+                    break;
+                case DIR_SPIN_RIGHT:
+                    Car_Spin_Right();
+                    break;
+                default:
+                    Stop_All_Motors();
+                    break;
+            }
+            break;
+    }
+}
+
+// 整车前进
+void Car_Move_Forward(void)
+{
+    for(int i = 0; i < 4; i++) {
+        MOTOR_FORWARD(motors[i].portA, motors[i].pinA, motors[i].portB, motors[i].pinB);
+    }
+}
+
+// 整车后退
+void Car_Move_Backward(void)
+{
+    for(int i = 0; i < 4; i++) {
+        MOTOR_BACKWARD(motors[i].portA, motors[i].pinA, motors[i].portB, motors[i].pinB);
+    }
+}
+
+// 整车左转
+void Car_Turn_Left(void)
+{
+    // 左侧轮后退，右侧轮前进
+    MOTOR_BACKWARD(motors[2].portA, motors[2].pinA, motors[2].portB, motors[2].pinB); // LR
+    MOTOR_BACKWARD(motors[3].portA, motors[3].pinA, motors[3].portB, motors[3].pinB); // LF
+    MOTOR_FORWARD(motors[0].portA, motors[0].pinA, motors[0].portB, motors[0].pinB);  // RR
+    MOTOR_FORWARD(motors[1].portA, motors[1].pinA, motors[1].portB, motors[1].pinB);  // RF
+}
+
+// 整车右转
+void Car_Turn_Right(void)
+{
+    // 右侧轮后退，左侧轮前进
+    MOTOR_BACKWARD(motors[0].portA, motors[0].pinA, motors[0].portB, motors[0].pinB); // RR
+    MOTOR_BACKWARD(motors[1].portA, motors[1].pinA, motors[1].portB, motors[1].pinB); // RF
+    MOTOR_FORWARD(motors[2].portA, motors[2].pinA, motors[2].portB, motors[2].pinB);  // LR
+    MOTOR_FORWARD(motors[3].portA, motors[3].pinA, motors[3].portB, motors[3].pinB);  // LF
+}
+
+// 整车原地左旋转
+void Car_Spin_Left(void)
+{
+    // 左侧后退，右侧前进
+    MOTOR_BACKWARD(motors[2].portA, motors[2].pinA, motors[2].portB, motors[2].pinB); // LR
+    MOTOR_BACKWARD(motors[3].portA, motors[3].pinA, motors[3].portB, motors[3].pinB); // LF
+    MOTOR_FORWARD(motors[0].portA, motors[0].pinA, motors[0].portB, motors[0].pinB);  // RR
+    MOTOR_FORWARD(motors[1].portA, motors[1].pinA, motors[1].portB, motors[1].pinB);  // RF
+}
+
+// 整车原地右旋转
+void Car_Spin_Right(void)
+{
+    // 右侧后退，左侧前进
+    MOTOR_BACKWARD(motors[0].portA, motors[0].pinA, motors[0].portB, motors[0].pinB); // RR
+    MOTOR_BACKWARD(motors[1].portA, motors[1].pinA, motors[1].portB, motors[1].pinB); // RF
+    MOTOR_FORWARD(motors[2].portA, motors[2].pinA, motors[2].portB, motors[2].pinB);  // LR
+    MOTOR_FORWARD(motors[3].portA, motors[3].pinA, motors[3].portB, motors[3].pinB);  // LF
+}
+
+// 串口命令处理
+void Process_Command(char* command)
+{
+    // 单个电机测试命令
+    if (strcmp(command, "test rr") == 0) {
+        Single_Motor_Test(MOTOR_RR);
+    }
+    else if (strcmp(command, "test rf") == 0) {
+        Single_Motor_Test(MOTOR_RF);
+    }
+    else if (strcmp(command, "test lr") == 0) {
+        Single_Motor_Test(MOTOR_LR);
+    }
+    else if (strcmp(command, "test lf") == 0) {
+        Single_Motor_Test(MOTOR_LF);
+    }
+    // 整车运动命令
+    else if (strcmp(command, "forward") == 0) {
+        Motor_Control(MOTOR_ALL, DIR_FORWARD);
+    }
+    else if (strcmp(command, "backward") == 0) {
+        Motor_Control(MOTOR_ALL, DIR_BACKWARD);
+    }
+    else if (strcmp(command, "left") == 0) {
+        Motor_Control(MOTOR_ALL, DIR_LEFT);
+    }
+    else if (strcmp(command, "right") == 0) {
+        Motor_Control(MOTOR_ALL, DIR_RIGHT);
+    }
+    else if (strcmp(command, "spin left") == 0) {
+        Motor_Control(MOTOR_ALL, DIR_SPIN_LEFT);
+    }
+    else if (strcmp(command, "spin right") == 0) {
+        Motor_Control(MOTOR_ALL, DIR_SPIN_RIGHT);
+    }
+    else if (strcmp(command, "stop") == 0) {
+        Stop_All_Motors();
+    }
+    else if (strcmp(command, "estop") == 0) {
+        Emergency_Stop();
+    }
+    else if (strcmp(command, "enable") == 0) {
+        motorEnabled = true;
+        printf("Motors enabled\r\n");
+    }
+    else if (strcmp(command, "status") == 0) {
+        printf("Motor status: %s\r\n", motorEnabled ? "ENABLED" : "DISABLED");
+    }
+    else if (strcmp(command, "help") == 0) {
+        Print_Menu();
+    }
+    else {
+        printf("Unknown command: %s\r\n", command);
+        Print_Menu();
+    }
+}
+
+// 串口输入处理
+void Handle_UART_Input(void)
+{
+    if (HAL_UART_Receive(&huart1, (uint8_t*)&uartBuffer[uartIndex], 1, 10) == HAL_OK) {
+        if (uartBuffer[uartIndex] == '\r' || uartBuffer[uartIndex] == '\n') {
+            uartBuffer[uartIndex] = '\0';
+            if (uartIndex > 0) {
+                printf("\r\n> Executing: %s\r\n", uartBuffer);
+                Process_Command(uartBuffer);
+                printf("\r\n> ");
+            }
+            uartIndex = 0;
+        } else {
+            uartIndex++;
+            if (uartIndex >= UART_BUFFER_SIZE - 1) {
+                uartIndex = 0;
+            }
+        }
+    }
+}
+
+// 打印帮助菜单
+void Print_Menu(void)
+{
+    printf("\r\n=== ROSMASTER X3 MOTOR CONTROL ===\r\n");
+    printf("Single Motor Tests:\r\n");
+    printf("  test rr    - Test right rear motor\r\n");
+    printf("  test rf    - Test right front motor\r\n");
+    printf("  test lr    - Test left rear motor\r\n");
+    printf("  test lf    - Test left front motor\r\n");
+    printf("\r\nCar Movement Commands:\r\n");
+    printf("  forward    - Move forward\r\n");
+    printf("  backward   - Move backward\r\n");
+    printf("  left       - Turn left\r\n");
+    printf("  right      - Turn right\r\n");
+    printf("  spin left  - Spin left (in place)\r\n");
+    printf("  spin right - Spin right (in place)\r\n");
+    printf("  stop       - Stop all motors\r\n");
+    printf("\r\nSafety Commands:\r\n");
+    printf("  estop      - Emergency stop (disable motors)\r\n");
+    printf("  enable     - Re-enable motors after estop\r\n");
+    printf("  status     - Check motor status\r\n");
+    printf("  help       - Show this menu\r\n");
+    printf("====================================\r\n");
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  printf("\r\n========================================");
+  printf("\r\nROSMASTER X3 MOTOR CONTROL SYSTEM");
+  printf("\r\nSTM32F103 + ST-Link Debug");
+  printf("\r\n========================================");
+
+  System_SelfTest();
+  Stop_All_Motors();
+
+  lastToggleTime = HAL_GetTick();
+  lastDebugTime = HAL_GetTick();
+
+  printf("\r\nSystem ready. Type 'help' for commands.");
+  printf("\r\n> ");
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    uint32_t currentTime = HAL_GetTick();
+
+    // LED心跳指示
+    if (currentTime - lastToggleTime >= 500) {
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+      lastToggleTime = currentTime;
+    }
+
+    // 处理串口输入
+    Handle_UART_Input();
+
+    // 定期状态报告
+    if (currentTime - lastDebugTime >= 3000) {
+        printf("\r\n[System OK - Type 'help' for commands]");
+        printf("\r\n> ");
+        lastDebugTime = currentTime;
+    }
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13|M1_A_Pin|M1_B_Pin|M2_A_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, M4_1_Pin|M4_2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, M3_A_Pin|M3_B_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(M2_B_GPIO_Port, M2_B_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PC13 M1_A_Pin M1_B_Pin M2_A_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|M1_A_Pin|M1_B_Pin|M2_A_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : M4_1_Pin M4_2_Pin */
+  GPIO_InitStruct.Pin = M4_1_Pin|M4_2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : M3_A_Pin M3_B_Pin */
+  GPIO_InitStruct.Pin = M3_A_Pin|M3_B_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : M2_B_Pin */
+  GPIO_InitStruct.Pin = M2_B_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(M2_B_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  __disable_irq();
+  while (1)
+  {
+    // 错误时快速闪烁LED
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    HAL_Delay(100);
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
