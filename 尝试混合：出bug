@@ -1,0 +1,942 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : RosMaster X3 - 混合PWM控制（硬件PWM + 软件PWM）
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Private typedef -----------------------------------------------------------*/
+typedef enum {
+    MOTOR_0 = 0,
+    MOTOR_1 = 1,
+    MOTOR_2 = 2,
+    MOTOR_3 = 3,
+} MotorID;
+
+typedef enum {
+    DIR_STOP = 0,
+    DIR_FORWARD,
+    DIR_BACKWARD
+} MotorDirection;
+
+typedef struct {
+    GPIO_TypeDef* portA;
+    uint16_t pinA;
+    GPIO_TypeDef* portB;
+    uint16_t pinB;
+    TIM_HandleTypeDef* tim;
+    uint32_t chA;
+    uint32_t chB;
+    bool use_hardware_pwm;
+    const char* name;
+    bool tested;
+    bool forward_ok;
+    bool backward_ok;
+    uint8_t speed;
+    bool enabled;
+    MotorDirection current_dir;
+} MotorConfig;
+
+/* Private define ------------------------------------------------------------*/
+#define M1_A_PORT      GPIOC
+#define M1_A_PIN       GPIO_PIN_7
+#define M1_B_PORT      GPIOC
+#define M1_B_PIN       GPIO_PIN_6
+
+#define M2_A_PORT      GPIOC
+#define M2_A_PIN       GPIO_PIN_9
+#define M2_B_PORT      GPIOC
+#define M2_B_PIN       GPIO_PIN_8
+
+#define M3_A_PORT      GPIOA
+#define M3_A_PIN       GPIO_PIN_11
+#define M3_B_PORT      GPIOA
+#define M3_B_PIN       GPIO_PIN_8
+
+#define M4_A_PORT      GPIOB
+#define M4_A_PIN       GPIO_PIN_0
+#define M4_B_PORT      GPIOB
+#define M4_B_PIN       GPIO_PIN_1
+
+#define UART_BUFFER_SIZE 64
+#define TEST_DURATION 3000
+#define PWM_PERIOD    7199
+#define SOFTWARE_PWM_CYCLE 100
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+UART_HandleTypeDef huart1;
+
+uint32_t lastToggleTime = 0;
+uint32_t pwmCounter = 0;
+char uartBuffer[UART_BUFFER_SIZE];
+uint8_t uartIndex = 0;
+bool globalEnabled = true;
+
+MotorConfig motors[4] = {
+    {M1_A_PORT, M1_A_PIN, M1_B_PORT, M1_B_PIN, &htim3, TIM_CHANNEL_2, TIM_CHANNEL_1, true, "Motor-1", false, false, false, 100, true, DIR_STOP},
+    {M2_A_PORT, M2_A_PIN, M2_B_PORT, M2_B_PIN, NULL, 0, 0, false, "Motor-2", false, false, false, 100, true, DIR_STOP},
+    {M3_A_PORT, M3_A_PIN, M3_B_PORT, M3_B_PIN, NULL, 0, 0, false, "Motor-3", false, false, false, 100, true, DIR_STOP},
+    {M4_A_PORT, M4_A_PIN, M4_B_PORT, M4_B_PIN, NULL, 0, 0, false, "Motor-4", false, false, false, 100, true, DIR_STOP}
+};
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM2_Init(void);
+void Error_Handler(void);
+
+void Stop_All_Motors(void);
+void Set_Motor_Speed(MotorID motor, uint8_t speed);
+void Update_Motor_PWM(void);
+void Single_Motor_Control(MotorID motor, MotorDirection direction);
+void Test_Single_Motor(MotorID motor);
+void Test_All_Motors_Sequence(void);
+void GPIO_Pin_Test(void);
+void Process_Command(char* command);
+void Handle_UART_Input(void);
+void Print_Menu(void);
+void Print_Test_Results(void);
+void Car_Move_Forward(void);
+void Car_Move_Backward(void);
+void Car_Turn_Left(void);
+void Car_Turn_Right(void);
+void Car_Spin_Left(void);
+void Car_Spin_Right(void);
+void Hardware_PWM_Forward(MotorID motor);
+void Hardware_PWM_Backward(MotorID motor);
+void Hardware_PWM_Stop(MotorID motor);
+int _write(int file, char *ptr, int len);
+
+/* USER CODE BEGIN 0 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
+void TIM2_IRQHandler(void);
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
+
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_USART1_UART_Init();
+  MX_TIM3_Init();
+  MX_TIM2_Init();
+
+  /* USER CODE BEGIN 2 */
+  printf("\r\n\r\n");
+  printf("========================================\r\n");
+  printf("   ROSMASTER X3 DIAGNOSTIC SYSTEM\r\n");
+  printf("   MIXED PWM CONTROL (HARDWARE + SOFTWARE)\r\n");
+  printf("========================================\r\n");
+  printf("STM32F103 + 4x Motor Drivers\r\n");
+  printf("Motor 0: Hardware PWM (TIM3 CH1/CH2)\r\n");
+  printf("Motor 1-3: Software PWM (TIM2中断驱动)\r\n");
+  printf("Build: %s %s\r\n", __DATE__, __TIME__);
+  printf("========================================\r\n");
+
+  Stop_All_Motors();
+
+  printf("\r\nSystem ready!\r\n");
+  printf("Type 'help' for commands or 'testall' to start diagnosis\r\n");
+  printf("Use 'psw <motor> <speed>' to set speed (0-100)\r\n");
+  printf("\r\n> ");
+
+  lastToggleTime = HAL_GetTick();
+  /* USER CODE END 2 */
+
+  while (1)
+  {
+    uint32_t currentTime = HAL_GetTick();
+
+    // LED心跳 - 每500ms切换
+    if (currentTime - lastToggleTime >= 500) {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        lastToggleTime = currentTime;
+    }
+
+    // 处理串口输入
+    Handle_UART_Input();
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = PWM_PERIOD;  // 修正为定义的PWM周期
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_TIM_MspPostInit(&htim3);
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 71;              // 72MHz / 72 = 1MHz
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;                // 1MHz / 1000 = 1kHz
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN TIM2_Init 2 */
+  // 配置TIM2中断并启动
+  HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(TIM2_IRQn);
+  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) {
+    Error_Handler();
+  }
+  /* USER CODE END TIM2_Init 2 */
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_AFIO_CLK_ENABLE();
+
+  // 初始化LED引脚
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  // Motor0 PWM引脚（TIM3重映射）
+  GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  // Motor1-3 软件PWM引脚
+  GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_11;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  // 开启TIM3重映射（关键！Motor0 PWM需要）
+  __HAL_AFIO_REMAP_TIM3_ENABLE();
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    HAL_Delay(100);
+  }
+}
+
+/* USER CODE BEGIN 4 */
+// printf重定向
+int _write(int file, char *ptr, int len)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+
+// 硬件PWM控制函数
+void Hardware_PWM_Forward(MotorID motor)
+{
+    if (motors[motor].use_hardware_pwm && motors[motor].tim) {
+        uint16_t pulse = (motors[motor].speed * PWM_PERIOD) / 100;
+        __HAL_TIM_SET_COMPARE(motors[motor].tim, motors[motor].chA, pulse);
+        __HAL_TIM_SET_COMPARE(motors[motor].tim, motors[motor].chB, 0);
+    }
+}
+
+void Hardware_PWM_Backward(MotorID motor)
+{
+    if (motors[motor].use_hardware_pwm && motors[motor].tim) {
+        uint16_t pulse = (motors[motor].speed * PWM_PERIOD) / 100;
+        __HAL_TIM_SET_COMPARE(motors[motor].tim, motors[motor].chA, 0);
+        __HAL_TIM_SET_COMPARE(motors[motor].tim, motors[motor].chB, pulse);
+    }
+}
+
+void Hardware_PWM_Stop(MotorID motor)
+{
+    if (motors[motor].use_hardware_pwm && motors[motor].tim) {
+        __HAL_TIM_SET_COMPARE(motors[motor].tim, motors[motor].chA, 0);
+        __HAL_TIM_SET_COMPARE(motors[motor].tim, motors[motor].chB, 0);
+    }
+}
+
+// PWM更新函数（控制电机）
+void Update_Motor_PWM(void)
+{
+    pwmCounter = (pwmCounter + 1) % SOFTWARE_PWM_CYCLE;
+
+    for (int i = 0; i < 4; i++) {
+        if (!globalEnabled || !motors[i].enabled) {
+            if (motors[i].use_hardware_pwm) {
+                Hardware_PWM_Stop(i);
+            } else {
+                HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_RESET);
+            }
+            continue;
+        }
+
+        if (motors[i].use_hardware_pwm) {
+            switch (motors[i].current_dir) {
+                case DIR_FORWARD:
+                    Hardware_PWM_Forward(i);
+                    break;
+                case DIR_BACKWARD:
+                    Hardware_PWM_Backward(i);
+                    break;
+                case DIR_STOP:
+                    Hardware_PWM_Stop(i);
+                    break;
+            }
+        } else {
+            uint16_t duty_cycle = (motors[i].speed * SOFTWARE_PWM_CYCLE) / 100;
+            if (pwmCounter < duty_cycle) {
+                switch (motors[i].current_dir) {
+                    case DIR_FORWARD:
+                        HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_SET);
+                        HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_RESET);
+                        break;
+                    case DIR_BACKWARD:
+                        HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_RESET);
+                        HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_SET);
+                        break;
+                    case DIR_STOP:
+                        HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_RESET);
+                        HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_RESET);
+                        break;
+                }
+            } else {
+                HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_RESET);
+            }
+        }
+    }
+}
+
+// 电机速度设置
+void Set_Motor_Speed(MotorID motor, uint8_t speed)
+{
+    if (speed > 100) speed = 100;
+    motors[motor].speed = speed;
+    printf("Motor %d speed set to %d%%\r\n", motor, speed);
+}
+
+// 停止所有电机
+void Stop_All_Motors(void)
+{
+    for(int i = 0; i < 4; i++) {
+        motors[i].current_dir = DIR_STOP;
+        motors[i].enabled = false;
+    }
+    printf("All motors stopped\r\n");
+}
+
+// 单电机控制
+void Single_Motor_Control(MotorID motor, MotorDirection direction)
+{
+    if(!globalEnabled) {
+        printf("Motors disabled!\r\n");
+        return;
+    }
+    if(motor >= 4) return;
+
+    const char* dir_names[] = {"STOP", "FORWARD", "BACKWARD"};
+    printf("%s -> %s (Speed: %d%%)\r\n", motors[motor].name, dir_names[direction], motors[motor].speed);
+
+    motors[motor].current_dir = direction;
+    motors[motor].enabled = (direction != DIR_STOP);
+
+    if (direction == DIR_FORWARD) motors[motor].forward_ok = true;
+    else if (direction == DIR_BACKWARD) motors[motor].backward_ok = true;
+}
+
+// 测试单电机
+void Test_Single_Motor(MotorID motor)
+{
+    if(motor >= 4) return;
+
+    printf("\r\n=== TESTING %s ===\r\n", motors[motor].name);
+
+    uint8_t original_speed = motors[motor].speed;
+    Set_Motor_Speed(motor, 50);
+
+    printf(">>> FORWARD test (3 seconds)...\r\n");
+    Single_Motor_Control(motor, DIR_FORWARD);
+    HAL_Delay(TEST_DURATION);
+
+    Single_Motor_Control(motor, DIR_STOP);
+    printf(">>> STOP (1 second)...\r\n");
+    HAL_Delay(1000);
+
+    printf(">>> BACKWARD test (3 seconds)...\r\n");
+    Single_Motor_Control(motor, DIR_BACKWARD);
+    HAL_Delay(TEST_DURATION);
+
+    Single_Motor_Control(motor, DIR_STOP);
+    printf(">>> STOP\r\n");
+
+    Set_Motor_Speed(motor, original_speed);
+    HAL_Delay(500);
+
+    motors[motor].tested = true;
+
+    printf("\r\nDid Motor %d work correctly? (y/n/f/b): ", motor);
+
+    uartIndex = 0;
+    while(1) {
+        if (HAL_UART_Receive(&huart1, (uint8_t*)&uartBuffer[uartIndex], 1, 100) == HAL_OK) {
+            if (uartBuffer[uartIndex] == 'y' || uartBuffer[uartIndex] == 'Y') {
+                motors[motor].forward_ok = true;
+                motors[motor].backward_ok = true;
+                printf("YES\r\n");
+                break;
+            } else if (uartBuffer[uartIndex] == 'n' || uartBuffer[uartIndex] == 'N') {
+                motors[motor].forward_ok = false;
+                motors[motor].backward_ok = false;
+                printf("NO\r\n");
+                break;
+            } else if (uartBuffer[uartIndex] == 'f' || uartBuffer[uartIndex] == 'F') {
+                motors[motor].forward_ok = true;
+                motors[motor].backward_ok = false;
+                printf("FORWARD ONLY\r\n");
+                break;
+            } else if (uartBuffer[uartIndex] == 'b' || uartBuffer[uartIndex] == 'B') {
+                motors[motor].forward_ok = false;
+                motors[motor].backward_ok = true;
+                printf("BACKWARD ONLY\r\n");
+                break;
+            }
+        }
+    }
+
+    printf("%s test completed!\r\n", motors[motor].name);
+}
+
+// 测试所有电机
+void Test_All_Motors_Sequence(void)
+{
+    printf("\r\n=== SEQUENTIAL MOTOR TEST ===\r\n");
+    printf("Will test all 4 motors one by one\r\n");
+    printf("Press any key to start...\r\n");
+
+    while(HAL_UART_Receive(&huart1, (uint8_t*)uartBuffer, 1, 100) != HAL_OK);
+
+    for(int i = 0; i < 4; i++) {
+        Test_Single_Motor(i);
+        HAL_Delay(1000);
+    }
+
+    Print_Test_Results();
+}
+
+// 打印测试结果
+void Print_Test_Results(void)
+{
+    printf("\r\n=== TEST RESULTS ===\r\n");
+    for(int i = 0; i < 4; i++) {
+        printf("Motor %d (%s): ", i, motors[i].name);
+        if(!motors[i].tested) {
+            printf("NOT TESTED\r\n");
+        } else if(motors[i].forward_ok && motors[i].backward_ok) {
+            printf("OK (Both directions)\r\n");
+        } else if(motors[i].forward_ok) {
+            printf("FORWARD ONLY\r\n");
+        } else if(motors[i].backward_ok) {
+            printf("BACKWARD ONLY\r\n");
+        } else {
+            printf("NOT WORKING\r\n");
+        }
+    }
+    printf("====================\r\n");
+}
+
+// 整车运动函数
+void Car_Move_Forward(void)
+{
+    if (!globalEnabled) {
+        printf("Motors disabled!\r\n");
+        return;
+    }
+    printf("Car moving FORWARD\r\n");
+    for(int i = 0; i < 4; i++) {
+        motors[i].current_dir = DIR_FORWARD;
+        motors[i].enabled = true;
+    }
+}
+
+void Car_Move_Backward(void)
+{
+    if (!globalEnabled) {
+        printf("Motors disabled!\r\n");
+        return;
+    }
+    printf("Car moving BACKWARD\r\n");
+    for(int i = 0; i < 4; i++) {
+        motors[i].current_dir = DIR_BACKWARD;
+        motors[i].enabled = true;
+    }
+}
+
+void Car_Turn_Left(void)
+{
+    if (!globalEnabled) {
+        printf("Motors disabled!\r\n");
+        return;
+    }
+    printf("Car turning LEFT\r\n");
+    motors[0].current_dir = DIR_FORWARD;
+    motors[1].current_dir = DIR_FORWARD;
+    motors[2].current_dir = DIR_BACKWARD;
+    motors[3].current_dir = DIR_BACKWARD;
+    for(int i = 0; i < 4; i++) {
+        motors[i].enabled = true;
+    }
+}
+
+void Car_Turn_Right(void)
+{
+    if (!globalEnabled) {
+        printf("Motors disabled!\r\n");
+        return;
+    }
+    printf("Car turning RIGHT\r\n");
+    motors[0].current_dir = DIR_BACKWARD;
+    motors[1].current_dir = DIR_BACKWARD;
+    motors[2].current_dir = DIR_FORWARD;
+    motors[3].current_dir = DIR_FORWARD;
+    for(int i = 0; i < 4; i++) {
+        motors[i].enabled = true;
+    }
+}
+
+void Car_Spin_Left(void)
+{
+    if (!globalEnabled) {
+        printf("Motors disabled!\r\n");
+        return;
+    }
+    printf("Car spinning LEFT (in place)\r\n");
+    motors[0].current_dir = DIR_FORWARD;
+    motors[1].current_dir = DIR_FORWARD;
+    motors[2].current_dir = DIR_BACKWARD;
+    motors[3].current_dir = DIR_BACKWARD;
+    for(int i = 0; i < 4; i++) {
+        motors[i].enabled = true;
+    }
+}
+
+void Car_Spin_Right(void)
+{
+    if (!globalEnabled) {
+        printf("Motors disabled!\r\n");
+        return;
+    }
+    printf("Car spinning RIGHT (in place)\r\n");
+    motors[0].current_dir = DIR_BACKWARD;
+    motors[1].current_dir = DIR_BACKWARD;
+    motors[2].current_dir = DIR_FORWARD;
+    motors[3].current_dir = DIR_FORWARD;
+    for(int i = 0; i < 4; i++) {
+        motors[i].enabled = true;
+    }
+}
+
+// GPIO测试函数
+void GPIO_Pin_Test(void)
+{
+    printf("\r\n=== GPIO PIN TEST ===\r\n");
+    printf("Testing all GPIO pins individually...\r\n\r\n");
+
+    for(int i = 0; i < 4; i++) {
+        printf("Motor %d (%s):\r\n", i, motors[i].name);
+
+        printf("  PIN A: ");
+        if(motors[i].portA == GPIOA) printf("PA");
+        else if(motors[i].portA == GPIOB) printf("PB");
+        else if(motors[i].portA == GPIOC) printf("PC");
+        printf("%d -> ", (int)(__builtin_ctz(motors[i].pinA)));
+
+        HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_SET);
+        HAL_Delay(100);
+        HAL_GPIO_WritePin(motors[i].portA, motors[i].pinA, GPIO_PIN_RESET);
+        printf("OK\r\n");
+
+        printf("  PIN B: ");
+        if(motors[i].portB == GPIOA) printf("PA");
+        else if(motors[i].portB == GPIOB) printf("PB");
+        else if(motors[i].portB == GPIOC) printf("PC");
+        printf("%d -> ", (int)(__builtin_ctz(motors[i].pinB)));
+
+        HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_SET);
+        HAL_Delay(100);
+        HAL_GPIO_WritePin(motors[i].portB, motors[i].pinB, GPIO_PIN_RESET);
+        printf("OK\r\n\r\n");
+    }
+
+    printf("GPIO test completed!\r\n");
+}
+
+// 串口命令处理
+void Process_Command(char* command)
+{
+    if (strncmp(command, "psw", 3) == 0) {
+        int motor_id;
+        int speed;
+        if (sscanf(command, "psw %d %d", &motor_id, &speed) == 2) {
+            if (motor_id >= 0 && motor_id < 4) {
+                Set_Motor_Speed(motor_id, speed);
+            } else {
+                printf("Invalid motor ID. Must be 0-3.\r\n");
+            }
+        } else {
+            printf("Use: 'psw <motor_id> <speed>' (speed 0-100)\r\n");
+        }
+        return;
+    }
+
+    if (strcmp(command, "test 0") == 0 || strcmp(command, "test0") == 0) {
+        Test_Single_Motor(MOTOR_0);
+    }
+    else if (strcmp(command, "test 1") == 0 || strcmp(command, "test1") == 0) {
+        Test_Single_Motor(MOTOR_1);
+    }
+    else if (strcmp(command, "test 2") == 0 || strcmp(command, "test2") == 0) {
+        Test_Single_Motor(MOTOR_2);
+    }
+    else if (strcmp(command, "test 3") == 0 || strcmp(command, "test3") == 0) {
+        Test_Single_Motor(MOTOR_3);
+    }
+    else if (strcmp(command, "testall") == 0) {
+        Test_All_Motors_Sequence();
+    }
+    else if (strcmp(command, "m0 fwd") == 0) {
+        Single_Motor_Control(MOTOR_0, DIR_FORWARD);
+    }
+    else if (strcmp(command, "m0 bwd") == 0) {
+        Single_Motor_Control(MOTOR_0, DIR_BACKWARD);
+    }
+    else if (strcmp(command, "m0 stop") == 0) {
+        Single_Motor_Control(MOTOR_0, DIR_STOP);
+    }
+    else if (strcmp(command, "m1 fwd") == 0) {
+        Single_Motor_Control(MOTOR_1, DIR_FORWARD);
+    }
+    else if (strcmp(command, "m1 bwd") == 0) {
+        Single_Motor_Control(MOTOR_1, DIR_BACKWARD);
+    }
+    else if (strcmp(command, "m1 stop") == 0) {
+        Single_Motor_Control(MOTOR_1, DIR_STOP);
+    }
+    else if (strcmp(command, "m2 fwd") == 0) {
+        Single_Motor_Control(MOTOR_2, DIR_FORWARD);
+    }
+    else if (strcmp(command, "m2 bwd") == 0) {
+        Single_Motor_Control(MOTOR_2, DIR_BACKWARD);
+    }
+    else if (strcmp(command, "m2 stop") == 0) {
+        Single_Motor_Control(MOTOR_2, DIR_STOP);
+    }
+    else if (strcmp(command, "m3 fwd") == 0) {
+        Single_Motor_Control(MOTOR_3, DIR_FORWARD);
+    }
+    else if (strcmp(command, "m3 bwd") == 0) {
+        Single_Motor_Control(MOTOR_3, DIR_BACKWARD);
+    }
+    else if (strcmp(command, "m3 stop") == 0) {
+        Single_Motor_Control(MOTOR_3, DIR_STOP);
+    }
+    else if (strcmp(command, "forward") == 0) {
+        Car_Move_Forward();
+    }
+    else if (strcmp(command, "backward") == 0) {
+        Car_Move_Backward();
+    }
+    else if (strcmp(command, "left") == 0) {
+        Car_Turn_Left();
+    }
+    else if (strcmp(command, "right") == 0) {
+        Car_Turn_Right();
+    }
+    else if (strcmp(command, "spinl") == 0) {
+        Car_Spin_Left();
+    }
+    else if (strcmp(command, "spinr") == 0) {
+        Car_Spin_Right();
+    }
+    else if (strcmp(command, "stop") == 0) {
+        Stop_All_Motors();
+    }
+    else if (strcmp(command, "gpio") == 0) {
+        GPIO_Pin_Test();
+    }
+    else if (strcmp(command, "status") == 0) {
+        Print_Test_Results();
+    }
+    else if (strcmp(command, "enable") == 0) {
+        globalEnabled = true;
+        printf("Motors ENABLED\r\n");
+    }
+    else if (strcmp(command, "disable") == 0) {
+        Stop_All_Motors();
+        globalEnabled = false;
+        printf("Motors DISABLED\r\n");
+    }
+    else if (strcmp(command, "help") == 0) {
+        Print_Menu();
+    }
+    else {
+        printf("Unknown command: %s\r\n", command);
+        printf("Type 'help' for command list\r\n");
+    }
+}
+
+// 串口输入处理
+void Handle_UART_Input(void)
+{
+    if (HAL_UART_Receive(&huart1, (uint8_t*)&uartBuffer[uartIndex], 1, 10) == HAL_OK) {
+        if (uartBuffer[uartIndex] == '\r' || uartBuffer[uartIndex] == '\n') {
+            uartBuffer[uartIndex] = '\0';
+            if (uartIndex > 0) {
+                printf("\r\nExecuting: %s\r\n", uartBuffer);
+                Process_Command(uartBuffer);
+                printf("\r\n> ");
+            }
+            uartIndex = 0;
+        } else if (uartBuffer[uartIndex] == '\b' || uartBuffer[uartIndex] == 127) {
+            if (uartIndex > 0) {
+                uartIndex--;
+                printf("\b \b");
+            }
+        } else {
+            printf("%c", uartBuffer[uartIndex]);
+            uartIndex++;
+            if (uartIndex >= UART_BUFFER_SIZE - 1) {
+                uartIndex = 0;
+                printf("\r\nBuffer overflow! Resetting...\r\n> ");
+            }
+        }
+    }
+}
+
+// 菜单打印
+void Print_Menu(void)
+{
+    printf("\r\n========================================\r\n");
+    printf("   ROSMASTER X3 MOTOR CONTROL MENU\r\n");
+    printf("        WITH SPEED CONTROL\r\n");
+    printf("========================================\r\n");
+    printf("\r\n[PIN CONFIGURATION]\r\n");
+    printf("  Motor 0: PC7(A), PC6(B) - Hardware PWM\r\n");
+    printf("  Motor 1: PC9(A), PC8(B) - Software PWM\r\n");
+    printf("  Motor 2: PA11(A), PA8(B) - Software PWM\r\n");
+    printf("  Motor 3: PB0(A), PB1(B) - Software PWM\r\n");
+    printf("\r\n[SPEED CONTROL]\r\n");
+    printf("  psw <id> <0-100> - Set motor speed\r\n");
+    printf("  Example: 'psw 0 50' - Motor0 50%% speed\r\n");
+    printf("\r\n[DIAGNOSTIC COMMANDS]\r\n");
+    printf("  gpio       - Test all GPIO pins\r\n");
+    printf("  test0      - Test Motor 0\r\n");
+    printf("  test1      - Test Motor 1\r\n");
+    printf("  test2      - Test Motor 2\r\n");
+    printf("  test3      - Test Motor 3\r\n");
+    printf("  testall    - Test all motors sequentially\r\n");
+    printf("  status     - Show test results\r\n");
+    printf("\r\n[SINGLE MOTOR CONTROL]\r\n");
+    printf("  m0 fwd/bwd/stop - Motor 0 control\r\n");
+    printf("  m1 fwd/bwd/stop - Motor 1 control\r\n");
+    printf("  m2 fwd/bwd/stop - Motor 2 control\r\n");
+    printf("  m3 fwd/bwd/stop - Motor 3 control\r\n");
+    printf("\r\n[CAR MOVEMENT COMMANDS]\r\n");
+    printf("  forward    - Move forward\r\n");
+    printf("  backward   - Move backward\r\n");
+    printf("  left       - Turn left\r\n");
+    printf("  right      - Turn right\r\n");
+    printf("  spinl      - Spin left (in place)\r\n");
+    printf("  spinr      - Spin right (in place)\r\n");
+    printf("  stop       - Stop all motors\r\n");
+    printf("\r\n[SYSTEM COMMANDS]\r\n");
+    printf("  enable     - Enable motors\r\n");
+    printf("  disable    - Disable motors\r\n");
+    printf("  help       - Show this menu\r\n");
+    printf("========================================\r\n");
+}
+
+// TIM2中断回调
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2) {
+        Update_Motor_PWM();
+    }
+}
+
+// TIM2中断处理函数
+
+/* USER CODE END 4 */
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    printf("Assert failed: file %s on line %d\r\n", file, line);
+}
+#endif /* USE_FULL_ASSERT */
